@@ -1,0 +1,235 @@
+--- sudo	2026-11-16 07:29:55.042997639 +0700
++++ sudo-patched	2026-11-16 07:38:06.782997451 +0700
+@@ -583,8 +583,9 @@
+ 
+         # If SUDO_SHELL_STDIN_STRING is set
+         if [ -n "$SUDO_SHELL_STDIN_STRING" ]; then
+-            # If SUDO_SHELL_BASENAME is in SUDO_SCRIPT_SHELLS_WITHOUT_PROCESS_SUBSTITUTION_SUPPORT
+-            if [[ " $SUDO_SCRIPT_SHELLS_WITHOUT_PROCESS_SUBSTITUTION_SUPPORT " == *" $SUDO_SHELL_BASENAME "* ]]; then
++            # Use herestring if the target shell lacks process substitution OR if legacy su falls back to /system/bin/sh (mksh)
++            if [[ " $SUDO_SCRIPT_SHELLS_WITHOUT_PROCESS_SUBSTITUTION_SUPPORT " == *" $SUDO_SHELL_BASENAME "* ]] || \
++                [[ "$SU_SHELL_OPTION_SUPPORTED" != "1" ]]; then
+                 # Pass SUDO_SHELL_STDIN_STRING as stdin with a herestring to SUDO_SHELL
+                 SUDO_COMMAND_TO_RUN+=' <<<'"'${SUDO_SHELL_STDIN_STRING//\'/\'\\\'\'}'"
+             else
+@@ -809,6 +810,9 @@
+     SU=""
+     SU_BIN_PATH=""
+     SU_INTERACTIVE_OPTION_SUPPORTED="0"
++    SU_SHELL_OPTION_SUPPORTED="0"
++    SU_PRESERVE_ENV_OPTION_SUPPORTED="0"
++    SU_MOUNT_MASTER_OPTION_SUPPORTED="0"
+ 
+     local -a su_search_paths=()
+     local su_skip_options_check="$SUDO_SU_SKIP_OPTIONS_CHECK"
+@@ -840,59 +844,34 @@
+         su_help="$("$su" --help 2>&1 < /dev/null)"
+         sudo_set_post_su_variables
+ 
+-        if [[ "$su_skip_options_check" != "1" ]]; then
+-            # If '--shell' option is not supported, then continue searching.
+-            if [[ "$su_help" != *"--shell"* ]]; then
+-                sudo_log 3 "The su binary found does not support '--shell' option, continuing search"
+-                continue
+-            # If '--preserve-environment' option is not supported, then continue searching.
+-            elif [[ "$su_help" != *"--preserve-environment"* ]]; then
+-                sudo_log 3 "The su binary found does not support '--preserve-environment' option, continuing search"
+-                sudo_log 5 "su_help:"$'\n```\n'"$su_help"$'\n```'
+-                continue
+-            # If '--mount-master' or '-c' options are not in help.
+-            elif [[ "$su_help" != *"--mount-master"* ]] ||
+-                    { [[ "$su_help" != *"-c,"* ]] && [[ "$su_help" != *"-c "* ]]; }; then
+-                # Run a test command with the `--mount-master` and `-c` option.
+-                # Some root implementations may not have
+-                # `--mount-master` or `-c` option in the help output,
+-                # like Magisk `>= 31.1`.
+-                # Magisk `>= 31.1` does support the `--mount-master` flag,
+-                # but internally maps it to `--target 0`, where `0`
+-                # implies using magisk global mount namespace.
+-                # The `-c` option is normally not provided by `su` binary,
+-                # but the target shell like `/system/bin/sh` or `bash`,
+-                # and it must be the last argument passed for `su`
+-                # commands so that it can be forwarded to the shell.
+-                # - https://github.com/topjohnwu/Magisk/pull/10140
+-                # - https://github.com/topjohnwu/Magisk/commit/160fb3e40bb2daaaaeb2432673769591e26d5cf8
+-                # Unlike `su --help`, this will invoke a root shell.
+-                # Normally, `sudo` runs 2 `su` root shell commands,
+-                # one for setup, and one for the actual user command,
+-                # and so running test command will result in an
+-                # additional root shell, which will have a performance
+-                # impact, but only for `su` implementations that do
+-                # not have above all the required options in help output.
+-                # Each `su` root shell executed normally takes
+-                # `10ms` or more to start, depending on device.
++        if [[ "$su_skip_options_check" == "1" ]]; then
++            sudo_log 3 "Skipping su options check; assuming modern su options are supported"
++            SU_SHELL_OPTION_SUPPORTED="1"
++            SU_PRESERVE_ENV_OPTION_SUPPORTED="1"
++            SU_MOUNT_MASTER_OPTION_SUPPORTED="1"
++            [[ "$su_help" == *"--interactive"* ]] && SU_INTERACTIVE_OPTION_SUPPORTED="1"
++        else
++            # Detect supported options individually so older/minimal su binaries can still work as fallbacks
++            [[ "$su_help" == *"--shell"* ]] && SU_SHELL_OPTION_SUPPORTED="1"
++            [[ "$su_help" == *"--preserve-environment"* ]] && SU_PRESERVE_ENV_OPTION_SUPPORTED="1"
++            [[ "$su_help" == *"--interactive"* ]] && SU_INTERACTIVE_OPTION_SUPPORTED="1"
++
++            if [[ "$su_help" == *"--mount-master"* ]]; then
++                SU_MOUNT_MASTER_OPTION_SUPPORTED="1"
++            else
+                 local su_options_test_output
+                 sudo_unset_pre_su_variables
+                 su_options_test_output="$("$su" --mount-master -c \
+                     'whoami; echo su-options-check;' 2>&1 < /dev/null)"
+                 sudo_set_post_su_variables
+ 
+-                # If did not get expected output, then continue searching.
+-                if [[ "$su_options_test_output" != $'root\nsu-options-check' ]]; then
+-                    sudo_log 3 "The su binary found does not support '--mount-master' or '-c' option, continuing search"
+-                    sudo_log 5 "su_help:"$'\n```\n'"$su_help"$'\n```'
+-                    sudo_log 3 "su_options_test_output:"$'\n```\n'"$su_options_test_output"$'\n```'
+-                    continue
++                if [[ "$su_options_test_output" == $'root\nsu-options-check' ]]; then
++                    SU_MOUNT_MASTER_OPTION_SUPPORTED="1"
++                    sudo_log 3 "The su binary supports '--mount-master' even though it is not listed in help"
+                 else
+-                    sudo_log 3 "The su binary found does support '--mount-master' and '-c' options even if they are not listed in help"
++                    sudo_log 3 "The su binary does not support '--mount-master'; continuing without global mount namespace flag"
+                 fi
+             fi
+-        else
+-            sudo_log 3 "Skipping su options check"
+         fi
+ 
+         # Else use the su.
+@@ -902,34 +881,28 @@
+         SU_BIN_PATH="${SU:0:${#SU} - ${#SU_BIN_PATH_BASENAME}}" # Substring from 0 to position of basename
+         case "$SU_BIN_PATH" in *[!/]*/) SU_BIN_PATH="${SU_BIN_PATH%"${SU_BIN_PATH##*[!/]}"}";; *[/]) SU_BIN_PATH="/";; esac # Remove trailing slashes if not root
+ 
+-        # If '--interactive' option is supported.
+-        # - https://github.com/topjohnwu/Magisk/commit/4864c1112
+-        if [[ "$su_help" == *"--interactive"* ]]; then
+-            SU_INTERACTIVE_OPTION_SUPPORTED=1
+-        fi
++        break
+     done
+ 
+     # If SU is not set
+     if [ -z "$SU" ]; then
+         # If su_found is not set to "1"
+-        if [[ "$su_found" != "1" ]] || [[ "$su_skip_options_check" == "1" ]]; then
+-            sudo_log_errors "No 'su' binary found"
+-        else
+-            sudo_log_errors "No 'su' binary found that supports the '-c', '--shell', '--preserve-environment' and '--mount-master' options"
+-        fi
+-
++        sudo_log_errors "No 'su' binary found"
+         sudo_log_errors "SU_SEARCH_PATHS: ${su_search_paths[*]}"
+-        sudo_log_errors "sudo requires a 'su' binary that supports the '-c', '--shell', '--preserve-environment' and '--mount-master' options"
+         return 1
+     fi
+ 
+     sudo_log 3 "SU='$SU'"
+     sudo_log 3 "SU_BIN_PATH='$SU_BIN_PATH'"
+     sudo_log 3 "SU_INTERACTIVE_OPTION_SUPPORTED='$SU_INTERACTIVE_OPTION_SUPPORTED'"
++    sudo_log 3 "SU_SHELL_OPTION_SUPPORTED='$SU_SHELL_OPTION_SUPPORTED'"
++    sudo_log 3 "SU_PRESERVE_ENV_OPTION_SUPPORTED='$SU_PRESERVE_ENV_OPTION_SUPPORTED'"
++    sudo_log 3 "SU_MOUNT_MASTER_OPTION_SUPPORTED='$SU_MOUNT_MASTER_OPTION_SUPPORTED'"
+ 
+     return 0
+ 
+ }
++
+ ##
+ # Set the su command that will be used to set up the sudo environment.
+ ##
+@@ -945,7 +918,8 @@
+     SU_ENV_COMMAND="$SU"
+ 
+     # If ROOTFS_PARTITION_MM_DEPENDENT_PATHS or SYSTEM_PARTITION_MM_DEPENDENT_PATHS is set
+-    if [ -n "$ROOTFS_PARTITION_MM_DEPENDENT_PATHS" ] || [ -n "$SYSTEM_PARTITION_MM_DEPENDENT_PATHS" ]; then
++    if [[ "$SU_MOUNT_MASTER_OPTION_SUPPORTED" == "1" ]] && \
++        { [ -n "$ROOTFS_PARTITION_MM_DEPENDENT_PATHS" ] || [ -n "$SYSTEM_PARTITION_MM_DEPENDENT_PATHS" ]; }; then
+         # If SUDO_SU_ENV_ADDITIONAL_COMMAND_OPTIONS does not start with the '--mount-master' or '-mm' command option, then
+         # add the '--mount-master' option to SU_ENV_COMMAND at the start as required by su
+         if [[ ! "${SUDO_SU_ENV_ADDITIONAL_COMMAND_OPTIONS[*]}" =~ $VALID_SU_MOUNT_MASTER_OPTION_PREFIXED_STRING  ]]; then
+@@ -977,7 +951,26 @@
+     # This has drastic performance improvements in some cases where multiple root
+     # commands need to be run since creating a new su shell for each command has too
+     # much overhead.
+-    SU_ENV_COMMAND+=" --preserve-environment --shell $BASH_SHELL_PATH -c $SU_ENV_COMMAND_VARIABLES_TO_EXPORT "
++    if [[ "$SU_PRESERVE_ENV_OPTION_SUPPORTED" == "1" ]]; then
++        SU_ENV_COMMAND+=" --preserve-environment"
++    fi
++
++    if [[ "$SU_SHELL_OPTION_SUPPORTED" == "1" ]]; then
++        SU_ENV_COMMAND+=" --shell $BASH_SHELL_PATH -c $SU_ENV_COMMAND_VARIABLES_TO_EXPORT "
++    else
++        # On legacy su without --shell, invoke Termux bash explicitly inside -c so bashisms (source, arrays, [[) work.
++        local inner_bash_cmd="$SU_ENV_COMMAND_VARIABLES_TO_EXPORT eval \"\$1\""
++        local inner_bash_cmd_quoted
++        printf -v inner_bash_cmd_quoted "%q" "$inner_bash_cmd"
++
++        local sh_payload
++        printf -v sh_payload "%q --noprofile --norc -c %s --" "$BASH_SHELL_PATH" "$inner_bash_cmd_quoted"
++
++        local sh_payload_escaped
++        printf -v sh_payload_escaped "%q" "$sh_payload"
++
++        SU_ENV_COMMAND+=" -c $sh_payload_escaped "
++    fi
+ 
+     sudo_log 3 "SU_ENV_COMMAND=\`$SU_ENV_COMMAND\`"
+ 
+@@ -997,7 +990,8 @@
+     SU_RUN_COMMAND="$SU"
+ 
+     # If ROOTFS_PARTITION_MM_DEPENDENT_PATHS or SYSTEM_PARTITION_MM_DEPENDENT_PATHS is set
+-    if [ -n "$ROOTFS_PARTITION_MM_DEPENDENT_PATHS" ] || [ -n "$SYSTEM_PARTITION_MM_DEPENDENT_PATHS" ]; then
++    if [[ "$SU_MOUNT_MASTER_OPTION_SUPPORTED" == "1" ]] && \
++        { [ -n "$ROOTFS_PARTITION_MM_DEPENDENT_PATHS" ] || [ -n "$SYSTEM_PARTITION_MM_DEPENDENT_PATHS" ]; }; then
+         # If SUDO_SU_RUN_ADDITIONAL_COMMAND_OPTIONS does not start with the '--mount-master' or '-mm' command option, then
+         # add the '--mount-master' option to SU_RUN_COMMAND at the start as required by su
+         if [[ ! "${SUDO_SU_RUN_ADDITIONAL_COMMAND_OPTIONS[*]}" =~ $VALID_SU_MOUNT_MASTER_OPTION_PREFIXED_STRING  ]]; then
+@@ -1021,11 +1015,15 @@
+     fi
+ 
+     # If DISABLE_PRESERVE_ENVIRONMENT_FOR_SU is not enabled, then use the option
+-    if [[ "$DISABLE_PRESERVE_ENVIRONMENT_FOR_SU" != "1" ]]; then
++    if [[ "$SU_PRESERVE_ENV_OPTION_SUPPORTED" == "1" ]] && [[ "$DISABLE_PRESERVE_ENVIRONMENT_FOR_SU" != "1" ]]; then
+         SU_RUN_COMMAND+=" --preserve-environment"
+     fi
+ 
+-    SU_RUN_COMMAND+=" --shell $BASH_SHELL_PATH -c"
++    if [[ "$SU_SHELL_OPTION_SUPPORTED" == "1" ]]; then
++        SU_RUN_COMMAND+=" --shell $BASH_SHELL_PATH"
++    fi
++
++    SU_RUN_COMMAND+=" -c"
+ 
+     sudo_log 3 "SU_RUN_COMMAND=\`$SU_RUN_COMMAND\`"
+ 
+@@ -3623,10 +3621,15 @@
+     )
+ 
+     local var
++    local inline_env_exports=""
+ 
+     # Export additional variables that are required by su that were not exported by sudo_export_or_unexport_shared_variables_for_su
+     for var in "${SU_ENV_COMMAND_ADDITIONAL_VARIABLES_TO_EXPORT_ARRAY[@]}"; do
+         export "${var}"
++        # Always inline critical variables into the -c command string as well.
++        # Magisk <= v23 uses a fixed 4096-byte socket buffer for --preserve-environment and silently
++        # drops the entire exported environment if total env size exceeds 4096 bytes.
++        inline_env_exports+="export ${var}='${!var//\'/\'\\\'\'}'; "
+     done
+ 
+ 
+@@ -3635,7 +3638,7 @@
+ 
+     # Run sudo_setup_sudo_shell_home_and_working_environment that sets up the sudo environment
+     sudo_unset_pre_su_variables
+-    su_output=$($SU_ENV_COMMAND "source '${SUDO_SCRIPT_PATH//\'/\'\\\'\'}' || exit \$?; sudo_setup_sudo_shell_home_and_working_environment;" 2>&1 < /dev/null)
++    su_output=$($SU_ENV_COMMAND "${inline_env_exports}source '${SUDO_SCRIPT_PATH//\'/\'\\\'\'}' || exit \$?; sudo_setup_sudo_shell_home_and_working_environment;" 2>&1 < /dev/null)
+     return_value=$?
+     sudo_set_post_su_variables
+     [ -n "$su_output" ] && echo "$su_output"
